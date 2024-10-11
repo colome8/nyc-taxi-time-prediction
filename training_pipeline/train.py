@@ -208,6 +208,7 @@ def model_registry(model_name: str, model_version: str = "1", alias: str = "cham
         name=model_name,
         alias=alias,
         version=model_version
+    
     )
 
     client.update_model_version(
