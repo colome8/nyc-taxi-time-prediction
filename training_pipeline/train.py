@@ -1,23 +1,22 @@
+import os
 import pickle
 import mlflow
 import pathlib
 import dagshub
 import pandas as pd
-import xgboost as xgb
 from hyperopt.pyll import scope
-from sklearn.metrics import root_mean_squared_error
+from sklearn.metrics import mean_squared_error
 from sklearn.feature_extraction import DictVectorizer
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 from prefect import flow, task
-from datetime import datetime
-from mlflow import MlflowClient
-import mlflow.pyfunc
-from mlflow.entities import ViewType
+from sklearn.ensemble import RandomForestRegressor
 
 
-@task(name="Read data", retries=4, retry_delay_seconds=[1, 4, 8, 16])
+@task(name="Read Data", retries=4, retry_delay_seconds=[1, 4, 8, 16])
 def read_data(file_path: str) -> pd.DataFrame:
     """Read data into DataFrame"""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"No se encontró el archivo: {file_path}")
     df = pd.read_parquet(file_path)
 
     df.lpep_dropoff_datetime = pd.to_datetime(df.lpep_dropoff_datetime)
@@ -34,13 +33,13 @@ def read_data(file_path: str) -> pd.DataFrame:
     return df
 
 
-@task(name="Add Features")
+@task(name="Add Feature")
 def add_features(df_train: pd.DataFrame, df_val: pd.DataFrame):
     """Add features to the model"""
     df_train["PU_DO"] = df_train["PULocationID"] + "_" + df_train["DOLocationID"]
     df_val["PU_DO"] = df_val["PULocationID"] + "_" + df_val["DOLocationID"]
 
-    categorical = ["PU_DO"]  #'PULocationID', 'DOLocationID']
+    categorical = ["PU_DO"]
     numerical = ["trip_distance"]
 
     dv = DictVectorizer()
@@ -56,56 +55,41 @@ def add_features(df_train: pd.DataFrame, df_val: pd.DataFrame):
     return X_train, X_val, y_train, y_val, dv
 
 
-@task(name="Hyper-Parameter Tuning")
-def hyper_parameter_tunning(X_train, X_val, y_train, y_val, dv):
-    
-    mlflow.xgboost.autolog()
-    
-    training_dataset = mlflow.data.from_numpy(X_train.data, targets=y_train, name="green_tripdata_2024-01")
-    
-    validation_dataset = mlflow.data.from_numpy(X_val.data, targets=y_val, name="green_tripdata_2024-02")
-    
-    train = xgb.DMatrix(X_train, label=y_train)
-    
-    valid = xgb.DMatrix(X_val, label=y_val)
-    
+@task(name="Hyper-parameter Tuning")
+def hyper_parameter_tuning(X_train, X_val, y_train, y_val, dv):
+    # Desactivar el autologging para evitar la advertencia
+    # Puedes reactivar funciones específicas si lo deseas
+    mlflow.sklearn.autolog(log_input_examples=False)
+
     def objective(params):
         with mlflow.start_run(nested=True):
-             
             # Tag model
-            mlflow.set_tag("model_family", "xgboost")
-            
+            mlflow.set_tag("model_family", "random_forest")
+
             # Train model
-            booster = xgb.train(
-                params=params,
-                dtrain=train,
-                num_boost_round=100,
-                evals=[(valid, 'validation')],
-                early_stopping_rounds=10
-            )
-            
-            # Predict in the val dataset
-            y_pred = booster.predict(valid)
-            
+            rf = RandomForestRegressor(**params)
+            rf.fit(X_train, y_train)
+
+            # Predict in the validation dataset
+            y_pred = rf.predict(X_val)
+
             # Calculate metric
-            rmse = root_mean_squared_error(y_val, y_pred)
-            
+            rmse = mean_squared_error(y_val, y_pred, squared=False)
+
             # Log performance metric
             mlflow.log_metric("rmse", rmse)
-    
+
         return {'loss': rmse, 'status': STATUS_OK}
 
-    with mlflow.start_run(run_name="Xgboost Hyper-parameter Optimization", nested=True):
+    with mlflow.start_run(run_name="Random-Forest Hyper-parameter Optimization", nested=True):
         search_space = {
-            'max_depth': scope.int(hp.quniform('max_depth', 4, 100, 1)),
-            'learning_rate': hp.loguniform('learning_rate', -3, 0),
-            'reg_alpha': hp.loguniform('reg_alpha', -5, -1),
-            'reg_lambda': hp.loguniform('reg_lambda', -6, -1),
-            'min_child_weight': hp.loguniform('min_child_weight', -1, 3),
-            'objective': 'reg:squarederror',
-            'seed': 42
+            'n_estimators': scope.int(hp.quniform('n_estimators', 50, 300, 10)),
+            'max_depth': scope.int(hp.quniform('max_depth', 5, 30, 1)),
+            'min_samples_split': scope.int(hp.quniform('min_samples_split', 2, 10, 1)),
+            'min_samples_leaf': scope.int(hp.quniform('min_samples_leaf', 1, 5, 1)),
+            'random_state': 42
         }
-        
+
         best_params = fmin(
             fn=objective,
             space=search_space,
@@ -113,10 +97,14 @@ def hyper_parameter_tunning(X_train, X_val, y_train, y_val, dv):
             max_evals=10,
             trials=Trials()
         )
+
+        # Convert params back to integers where necessary
+        best_params["n_estimators"] = int(best_params["n_estimators"])
         best_params["max_depth"] = int(best_params["max_depth"])
-        best_params["seed"] = 42
-        best_params["objective"] = "reg:squarederror"
-        
+        best_params["min_samples_split"] = int(best_params["min_samples_split"])
+        best_params["min_samples_leaf"] = int(best_params["min_samples_leaf"])
+        best_params["random_state"] = 42
+
         mlflow.log_params(best_params)
 
     return best_params
@@ -124,120 +112,95 @@ def hyper_parameter_tunning(X_train, X_val, y_train, y_val, dv):
 
 @task(name="Train Best Model")
 def train_best_model(X_train, X_val, y_train, y_val, dv, best_params) -> None:
-    """train a model with best hyperparams and write everything out"""
+    """Train a model with the best hyperparams and write everything out"""
 
     with mlflow.start_run(run_name="Best model ever"):
-        train = xgb.DMatrix(X_train, label=y_train)
-        valid = xgb.DMatrix(X_val, label=y_val)
+        rf = RandomForestRegressor(**best_params)
+        rf.fit(X_train, y_train)
 
-        mlflow.log_params(best_params)
-
-        # Log a fit model instance
-        booster = xgb.train(
-            params=best_params,
-            dtrain=train,
-            num_boost_round=100,
-            evals=[(valid, 'validation')],
-            early_stopping_rounds=10
-        )
-
-        y_pred = booster.predict(valid)
-        rmse = root_mean_squared_error(y_val, y_pred)
+        y_pred = rf.predict(X_val)
+        rmse = mean_squared_error(y_val, y_pred, squared=False)
         mlflow.log_metric("rmse", rmse)
 
         pathlib.Path("models").mkdir(exist_ok=True)
         with open("models/preprocessor.b", "wb") as f_out:
             pickle.dump(dv, f_out)
-        
+
         mlflow.log_artifact("models/preprocessor.b", artifact_path="preprocessor")
-    
+        mlflow.sklearn.log_model(rf, artifact_path="models")
+
     return None
 
 
-@task(name="Model Registry")
-def model_registry(model_name: str, model_version: str = "1", alias: str = "champion"):
-    """Register and transition the model version in the MLflow registry."""
-    
-    # MLflow client initialization
-    MLFLOW_TRACKING_URI = mlflow.get_tracking_uri()
-    client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+@task(name="Register Best Model")
+def register_model(tracking_uri: str, experiment_name: str, model_name: str, alias: str) -> None:
+    """Register the best model in the MLflow Model Registry and assign an alias."""
+    from mlflow.tracking import MlflowClient
 
-        # Get the experiment by name
-    experiment = client.get_experiment_by_name(model_name)
+    client = MlflowClient(tracking_uri=tracking_uri)
 
-    if experiment is None:
-        raise ValueError(f"Experiment with name {model_name} not found")
-    
-    experiment_id = experiment.experiment_id
-    
-    # Search for all runs in the experiment
-    runs = mlflow.search_runs(experiment_ids=[experiment_id], 
-                          filter_string="metrics.rmse IS NOT NULL",
-                          run_view_type=ViewType.ACTIVE_ONLY,
-                          order_by=["metrics.rmse ASC"])
+    # Obtener el experimento por nombre
+    experiment = client.get_experiment_by_name(experiment_name)
+    if not experiment:
+        raise ValueError(f"Experiment '{experiment_name}' not found.")
 
+    # Buscar los runs ordenados por RMSE ascendente
+    runs = client.search_runs(
+        experiment_ids=experiment.experiment_id,
+        order_by=["metrics.rmse ASC"],
+        max_results=1
+    )
 
-    # Check if any runs were found
-    if runs.empty:
-        raise ValueError(f"No runs found for experiment {model_name}")
+    if not runs:
+        raise ValueError("No runs found in the experiment.")
 
-    # Get the run with the lowest RMSE (first run, since it's ordered)
-    best_run = runs.iloc[0]
-    best_run_id = best_run["run_id"]
-    best_rmse = best_run["metrics.rmse"]
+    best_run = runs[0]
+    best_run_id = best_run.info.run_id
 
-    # Define model URI based on the run_id
-    run_uri = f"runs:/{best_run_id}/model"
-    
-    # Register the model
-    result = mlflow.register_model(
+    # Definir el URI del run para registrar el modelo
+    # Asegúrate de que el artifact_path coincide con cómo loggeaste el modelo
+    run_uri = f"runs:/{best_run_id}/models/model"
+
+    # Registrar el modelo en el Model Registry
+    result = client.register_model(
         model_uri=run_uri,
         name=model_name
     )
 
-    # Update the model registry with a description
-    client.update_registered_model(
-        name=model_name,
-        description=f"Model registry for {model_name} project",
-    )
-    
-    # Transition the registered model version to the alias (e.g., "champion")
-    date = datetime.today()
-
+    # Asignar el alias '@champion' a la versión registrada
     client.set_registered_model_alias(
         name=model_name,
         alias=alias,
-        version=model_version
-    
+        version=result.version
     )
 
+    # Opcional: Actualizar la descripción de la versión del modelo
     client.update_model_version(
         name=model_name,
-        version=model_version,
-        description=f"The model version {model_version} was transitioned to {alias} on {date}",
+        version=result.version,
+        description=f"Model version {result.version} registered as '{alias}' with RMSE: {best_run.data.metrics['rmse']:.4f}"
     )
 
-    # Load the champion version of the model
-    model_uri = f"models:/{model_name}@{alias}"
-    champion_version = mlflow.pyfunc.load_model(
-        model_uri=model_uri
-    )
-    
-    return champion_version
+    print(f"Model '{model_name}' version {result.version} registered and aliased as '{alias}'.")
 
 
 @flow(name="Main Flow")
-def main_flow(year: str, month_train: str, month_val: str) -> None:
+def main_flow(year: int, month_train: int, month_val: int) -> None:
     """The main training pipeline"""
-    
-    train_path = f"../data/green_tripdata_{year}-{month_train}.parquet"
-    val_path = f"../data/green_tripdata_{year}-{month_val}.parquet"
-    
+
+    # Obtener la ruta absoluta del directorio donde se encuentra este script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Construir las rutas absolutas de los archivos de datos
+    train_path = os.path.join(script_dir, '..', 'data', f'green_tripdata_{year}-{month_train:02d}.parquet')
+    val_path = os.path.join(script_dir, '..', 'data', f'green_tripdata_{year}-{month_val:02d}.parquet')
+
     # MLflow settings
-    dagshub.init(url="https://dagshub.com/colome8/nyc-taxi-time-prediction.mlflow", mlflow=True)
-    
+    dagshub.init(repo_owner='JuanPab2009', repo_name='nyc-taxi-time-prediction', mlflow=True)
+
     MLFLOW_TRACKING_URI = mlflow.get_tracking_uri()
-    
+    print(f"MLflow Tracking URI: {MLFLOW_TRACKING_URI}")
+
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(experiment_name="nyc-taxi-experiment-prefect")
 
@@ -247,15 +210,21 @@ def main_flow(year: str, month_train: str, month_val: str) -> None:
 
     # Transform
     X_train, X_val, y_train, y_val, dv = add_features(df_train, df_val)
-    
-    # Hyper-parameter Tunning
-    best_params = hyper_parameter_tunning(X_train, X_val, y_train, y_val, dv)
-    
+
+    # Hyper-parameter Tuning
+    best_params = hyper_parameter_tuning(X_train, X_val, y_train, y_val, dv)
+
     # Train
     train_best_model(X_train, X_val, y_train, y_val, dv, best_params)
 
-    # model_registry
-    model_registry("nyc-taxi-experiment-prefect", "2")
+    # Registrar el mejor modelo en el Model Registry
+    register_model(
+        tracking_uri=MLFLOW_TRACKING_URI,
+        experiment_name="nyc-taxi-experiment-prefect",
+        model_name="nyc-taxi-model-prefect",
+        alias="champion"
+    )
 
 
-main_flow("2024", "01", "02")
+if __name__ == "__main__":
+    main_flow(year=2024, month_train=1, month_val=2)
