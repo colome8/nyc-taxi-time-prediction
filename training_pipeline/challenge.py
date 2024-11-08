@@ -170,11 +170,11 @@ def update_best_model(model_name) -> None:
 def main_flow(year: str, month_train: str, month_val: str) -> None:
     """The main training pipeline"""
 
-    train_path = '/Users/juanpabloblanco/Documents/nys-taxi-time-prediction/data/green_tripdata_2024-01.parquet'
-    val_path = '/Users/juanpabloblanco/Documents/nys-taxi-time-prediction/data/green_tripdata_2024-02.parquet'
+    train_path = 'C:\Users\colom\OneDrive - ITESO\iteso\5to semestre\cienciadatos\nyc-taxi-time-prediction\data\green_tripdata_2024-01.parquet'
+    val_path = 'C:\Users\colom\OneDrive - ITESO\iteso\5to semestre\cienciadatos\nyc-taxi-time-prediction\data\green_tripdata_2024-02.parquet'
 
     # MLflow settings
-    dagshub.init(url="https://dagshub.com/JuanPab2009/nyc-taxi-time-prediction", mlflow=True)
+    dagshub.init(url="https://dagshub.com/colome8/nyc-taxi-time-prediction", mlflow=True)
 
     MLFLOW_TRACKING_URI = mlflow.get_tracking_uri()
 

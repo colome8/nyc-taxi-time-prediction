@@ -6,10 +6,10 @@ from mlflow import MlflowClient
 
 
 # MLflow settings
-dagshub_repo = "https://dagshub.com/JuanPab2009/nyc-taxi-time-prediction"
+dagshub_repo = "https://dagshub.com/colome8/nyc-taxi-time-prediction"
 
 # MLFLOW_TRACKING_URI = mlflow.get_tracking_uri()
-MLFLOW_TRACKING_URI = "https://dagshub.com/JuanPab2009/nyc-taxi-time-prediction.mlflow"
+MLFLOW_TRACKING_URI = "https://dagshub.com/colome8/nyc-taxi-time-prediction.mlflow"
 
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)

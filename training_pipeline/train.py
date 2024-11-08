@@ -196,7 +196,7 @@ def main_flow(year: int, month_train: int, month_val: int) -> None:
     val_path = os.path.join(script_dir, '..', 'data', f'green_tripdata_{year}-{month_val:02d}.parquet')
 
     # MLflow settings
-    dagshub.init(repo_owner='JuanPab2009', repo_name='nyc-taxi-time-prediction', mlflow=True)
+    dagshub.init(repo_owner='colome8', repo_name='nyc-taxi-time-prediction', mlflow=True)
 
     MLFLOW_TRACKING_URI = mlflow.get_tracking_uri()
     print(f"MLflow Tracking URI: {MLFLOW_TRACKING_URI}")
